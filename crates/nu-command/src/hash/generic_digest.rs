@@ -2,6 +2,7 @@ use crate::input_handler::{operate, CmdArgument};
 use nu_engine::CallExt;
 use nu_protocol::ast::{Call, CellPath};
 use nu_protocol::engine::{Command, EngineState, Stack};
+use nu_protocol::IntoPipelineData;
 use nu_protocol::Span;
 use nu_protocol::{
     Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type, Value,
@@ -88,13 +89,64 @@ where
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
         let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
         let args = Arguments { binary, cell_paths };
-        operate(
-            action::<D>,
-            args,
-            input,
-            call.head,
-            engine_state.ctrlc.clone(),
-        )
+
+        match input {
+            PipelineData::ExternalStream {
+                stdout: Some(stream),
+                span,
+                ..
+            } => {
+                let mut digest = D::new();
+                for item in stream {
+                    let byte_slice = match &item {
+                        // String and binary data are valid byte patterns
+                        Ok(Value::String { val, .. }) => val.as_bytes(),
+                        Ok(Value::Binary { val, .. }) => val,
+                        // If any Error value is output, echo it back
+                        Ok(v @ Value::Error { .. }) => return Ok(v.clone().into_pipeline_data()),
+                        // Unsupported data
+                        Ok(other) => {
+                            return Ok(Value::Error {
+                                error: ShellError::OnlySupportsThisInputType(
+                                    "string and binary".into(),
+                                    other.get_type().to_string(),
+                                    span,
+                                    // This line requires the Value::Error match above.
+                                    other.expect_span(),
+                                ),
+                            }
+                            .into_pipeline_data());
+                        }
+                        Err(err) => return Err(err.to_owned()),
+                    };
+
+                    digest.update(byte_slice);
+                }
+
+                let hash = digest.finalize();
+
+                if args.binary {
+                    Ok(Value::Binary {
+                        val: hash.to_vec(),
+                        span,
+                    }
+                    .into_pipeline_data())
+                } else {
+                    Ok(Value::String {
+                        val: format!("{hash:x}"),
+                        span,
+                    }
+                    .into_pipeline_data())
+                }
+            }
+            _ => operate(
+                action::<D>,
+                args,
+                input,
+                call.head,
+                engine_state.ctrlc.clone(),
+            ),
+        }
     }
 }
 
